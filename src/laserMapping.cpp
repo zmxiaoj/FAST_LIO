@@ -84,6 +84,7 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+string pose_save_path;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -95,6 +96,9 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+// 判断是否从rosbag中读取数据
+bool   rosbag_play = false;
+
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -326,6 +330,86 @@ void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    lidar_buffer.push_back(ptr);
+    time_buffer.push_back(last_timestamp_lidar);
+    
+    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
+/**
+ * @brief transfer livox_ros::Point to livox_ros_driver2::CustomPoint
+ * 
+ * @param input_pc 
+ * @param output_pc 
+ */
+inline void LivoxPointCloud2LivoxCustomMsg(const pcl::PointCloud<livox_ros::Point>& input_pc,
+                                           livox_ros_driver2::CustomMsg::Ptr output_pc) {
+    output_pc->header.stamp = ros::Time(input_pc.header.stamp / float(1000000));
+    output_pc->header.frame_id = input_pc.header.frame_id;
+    output_pc->header.seq = input_pc.header.seq;
+
+    uint64_t base_time = input_pc.header.stamp * 1000;
+    output_pc->timebase = base_time;
+
+    int num_of_points = input_pc.width * input_pc.height;
+    output_pc->point_num = num_of_points;
+    output_pc->points.resize(num_of_points);
+
+    for(int i = 0; i < num_of_points; ++i) 
+    {
+        if(isnan(input_pc.at(i).x)||isnan(input_pc.at(i).y)||isnan(input_pc.at(i).z))
+            continue;
+        livox_ros_driver2::CustomPoint point;
+        point.x = input_pc.at(i).x;
+        point.y = input_pc.at(i).y;
+        point.z = input_pc.at(i).z;
+        point.reflectivity = input_pc.at(i).intensity;
+        point.line = input_pc.at(i).line;
+        point.tag = input_pc.at(i).tag;
+        point.offset_time =  static_cast<uint32_t>(static_cast<uint64_t>(input_pc.at(i).timestamp) - base_time); // TODO: double 2 uint32_t ???
+        output_pc->points[i] = point;
+    }
+}
+
+/**
+ * @brief callback function for livox_ros_driver2::CustomMsg
+ * 
+ * @param msg 
+ */
+void livox_ros_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) 
+{
+    mtx_buffer.lock();
+    double preprocess_start_time = omp_get_wtime();
+    scan_count ++;
+    if (msg->header.stamp.toSec() < last_timestamp_lidar)
+    {
+        ROS_ERROR("lidar loop back, clear buffer");
+        lidar_buffer.clear();
+    }
+    last_timestamp_lidar = msg->header.stamp.toSec();
+    
+    if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
+    {
+        printf("IMU and LiDAR not Synced, IMU time: %lf, lidar header time: %lf \n",last_timestamp_imu, last_timestamp_lidar);
+    }
+
+    if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty())
+    {
+        timediff_set_flg = true;
+        timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
+        printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
+    }
+
+    pcl::PointCloud<livox_ros::Point> livox_ros_pl;
+    pcl::fromROSMsg(*msg, livox_ros_pl);
+
+    livox_ros_driver2::CustomMsg::Ptr livox_msg(new livox_ros_driver2::CustomMsg);
+    LivoxPointCloud2LivoxCustomMsg(livox_ros_pl, livox_msg);
+    
+    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    p_pre->process(livox_msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
@@ -583,12 +667,45 @@ void set_posestamp(T & out)
     
 }
 
+/**
+ * @brief save pose to file
+ * 
+ * @param pose 
+ * @param save_path 
+ */
+void save_pose(nav_msgs::Odometry& pose, std::string& save_path) 
+{
+    // std::string save_path = "/home/comb/Data/paper/fusion_map_bag/gt/nmb_hall_lidar_cam_light_gt.txt";
+    fstream f;
+    f.open(save_path, ios::out|ios::app);
+    if (f.fail())
+    {
+        ROS_ERROR("svae pose file failed");
+        return;
+    }
+    f.setf(ios::fixed, ios::floatfield);
+    f.precision(9);
+    f << pose.header.stamp.toSec() << " "
+      << pose.pose.pose.position.x << " "
+      << pose.pose.pose.position.y << " "
+      << pose.pose.pose.position.z << " "
+      << pose.pose.pose.orientation.x << " "
+      << pose.pose.pose.orientation.y << " "
+      << pose.pose.pose.orientation.z << " "
+      << pose.pose.pose.orientation.w << std::endl;
+
+    f.close();
+    
+    return;
+}
+
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+    save_pose(odomAftMapped, pose_save_path);
     pubOdomAftMapped.publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
@@ -788,6 +905,10 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    // 判断是否在处理rosbag数据
+    nh.param<bool>("rosbag_play", rosbag_play, false);
+    // 读取pose保存路径
+    nh.param<string>("pose_save_path", pose_save_path, "");
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
     
     path.header.stamp    = ros::Time::now();
@@ -837,9 +958,20 @@ int main(int argc, char** argv)
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
     /*** ROS subscribe initialization ***/
-    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
-        nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
-        nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
+    // 根据是否是rosbag数据，选择不同的订阅方式
+    ros::Subscriber sub_pcl;
+    if (!rosbag_play)
+    {
+        sub_pcl = p_pre->lidar_type == AVIA ? \
+            nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
+            nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
+    }
+    else
+    {
+        sub_pcl = p_pre->lidar_type == AVIA ? \
+            nh.subscribe(lid_topic, 200000, livox_ros_pcl_cbk) : \
+            nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
+    }
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
