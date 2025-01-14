@@ -685,6 +685,7 @@ void save_pose(nav_msgs::Odometry& pose, std::string& save_path)
     }
     f.setf(ios::fixed, ios::floatfield);
     f.precision(9);
+    // pose: x y z q.x q.y q.z q.w
     f << pose.header.stamp.toSec() << " "
       << pose.pose.pose.position.x << " "
       << pose.pose.pose.position.y << " "
